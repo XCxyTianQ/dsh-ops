@@ -1,7 +1,8 @@
 //! Native file-operation capabilities. All paths are host-resolved absolute paths;
 //! this module never invokes a shell and never follows links.
 use crate::contract::{Failure, Request, Result};
-use cap_fs_ext::{DirExt, FollowSymlinks, OpenOptionsFollowExt};
+#[cfg(not(target_env = "ohos"))]
+use cap_fs_ext::{FollowSymlinks, OpenOptionsFollowExt};
 use regex::RegexBuilder;
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -120,7 +121,7 @@ struct WalkResult {
 
 fn walk(root: &Path) -> Result<WalkResult> {
     let target = crate::file_path::checked(root.to_str().ok_or_else(|| Failure::new("INVALID_ARGUMENT", "Non-UTF8 path"))?)?;
-    let directory = target.parent.open_dir_nofollow(&target.name)?;
+    let directory = crate::file_path::target_dir(&target)?;
     let mut files = Vec::new();
     let mut truncated = false;
     visit_dir(root, root, directory, 0, &mut files, &mut truncated)?;
@@ -147,12 +148,12 @@ fn visit_dir(root: &Path, display: &Path, directory: cap_std::fs::Dir, depth: us
     names.sort();
     for name in names {
         if crate::file_path::validate_name(&name).is_err() || name == ".git" { continue; }
-        let metadata = match directory.symlink_metadata(&name) {
+        let child = display.join(&name);
+        let metadata = match crate::file_path::entry_metadata(&directory, &child, &name) {
             Ok(metadata) => metadata,
             Err(_) => continue,
         };
         if crate::file_path::link(&metadata) { continue; }
-        let child = display.join(&name);
         if host_link_or_reparse(&child) { continue; }
         if hidden(&child, root) || matches!(name.as_str(), ".git" | ".dsh-ops" | "node_modules" | "target" | ".venv") { continue; }
         if metadata.is_file() {
@@ -161,7 +162,7 @@ fn visit_dir(root: &Path, display: &Path, directory: cap_std::fs::Dir, depth: us
             continue;
         }
         if metadata.is_dir() {
-            let Ok(child_dir) = directory.open_dir_nofollow(&name) else { continue };
+            let Ok(child_dir) = crate::file_path::entry_dir(&directory, &child, &name) else { continue };
             visit_dir(root, &child, child_dir, depth + 1, output, truncated)?;
             if *truncated && output.len() >= MAX_ENTRIES { return Ok(()); }
         }
@@ -295,22 +296,45 @@ fn replace(request: &Request) -> Result<Value> {
 fn atomic_write(path: &Path, bytes: &[u8]) -> Result<()> {
     let raw = path.to_str().ok_or_else(|| Failure::new("INVALID_ARGUMENT", "Non-UTF8 path"))?;
     let checked = crate::file_path::checked(raw)?;
-    let parent = checked.parent;
     let name = checked.name;
-    let temporary = format!(".{name}.dsh-ops-{}", uuid::Uuid::new_v4());
-    let mut options = cap_std::fs::OpenOptions::new();
-    options.write(true).create_new(true).follow(FollowSymlinks::No);
-    let mut file = parent.open_with(&temporary, &options).map_err(|e| Failure::new("ACCESS_DENIED", format!("Atomic replacement create: {e}")))?;
-    file.write_all(bytes)?;
-    file.sync_all()?;
-    drop(file);
-    // Publication stays handle-relative and does not traverse links.
-    let publish = parent.rename(&temporary, &parent, &name);
-    if let Err(error) = publish {
-        let _ = parent.remove_file(&temporary);
-        return Err(Failure::new("ACCESS_DENIED", format!("Atomic replacement publish: {error}")));
+    let temporary = checked.display.with_file_name(format!(".{name}.dsh-ops-{}", uuid::Uuid::new_v4()));
+    #[cfg(target_env = "ohos")]
+    {
+        // Absolute paths only: this platform terminates the process on the
+        // handle-relative calls cap-std would use here. `create_new` keeps the
+        // temporary name unclaimed, and the publish is a same-directory rename.
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        let mut file = options.open(&temporary).map_err(|e| Failure::new("ACCESS_DENIED", format!("Atomic replacement create: {e}")))?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        drop(file);
+        if let Err(error) = std::fs::rename(&temporary, &checked.display) {
+            let _ = std::fs::remove_file(&temporary);
+            return Err(Failure::new("ACCESS_DENIED", format!("Atomic replacement publish: {error}")));
+        }
+        if let Some(parent) = checked.display.parent() {
+            if let Ok(directory) = std::fs::File::open(parent) { directory.sync_all()?; }
+        }
+        return Ok(());
     }
-    #[cfg(unix)]
-    parent.try_clone()?.into_std_file().sync_all()?;
-    Ok(())
+    #[cfg(not(target_env = "ohos"))]
+    {
+        let parent = checked.parent;
+        let mut options = cap_std::fs::OpenOptions::new();
+        options.write(true).create_new(true).follow(FollowSymlinks::No);
+        let mut file = parent.open_with(&temporary, &options).map_err(|e| Failure::new("ACCESS_DENIED", format!("Atomic replacement create: {e}")))?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        drop(file);
+        // Publication stays handle-relative and does not traverse links.
+        let publish = parent.rename(&temporary, &parent, &name);
+        if let Err(error) = publish {
+            let _ = parent.remove_file(&temporary);
+            return Err(Failure::new("ACCESS_DENIED", format!("Atomic replacement publish: {error}")));
+        }
+        #[cfg(unix)]
+        parent.try_clone()?.into_std_file().sync_all()?;
+        Ok(())
+    }
 }
