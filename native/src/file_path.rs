@@ -7,6 +7,38 @@ use cap_std::{ambient_authority, fs::{Dir, File, Metadata, OpenOptions}};
 use std::path::{Component, Path, PathBuf};
 
 pub struct Target { pub parent: Dir, pub name: String, pub display: PathBuf }
+
+/// Open the deepest ancestor of `names` this process is allowed to open,
+/// returning that directory and how many leading names it consumed.
+///
+/// Desktop platforms let a process open `/`, which is why the root is tried
+/// first. Sandboxed platforms do not: on HarmonyOS the app sandbox still
+/// answers `symlink_metadata` for every path but refuses to open `/`,
+/// `/storage`, `/data` and `/system`, so a root anchor turns every absolute
+/// path into `EACCES`. Walking down to the longest openable prefix keeps those
+/// platforms usable. Each component folded into the anchor is rejected when it
+/// is a link, and every component below the anchor keeps the existing
+/// no-follow descent; the anchor's own components are the one place this
+/// function opens a path it did not verify with a directory handle, and it
+/// only reaches that path when opening the root has already failed.
+fn open_anchor(anchor: &Path, names: &[String]) -> Result<(Dir, usize)> {
+    if let Ok(dir) = Dir::open_ambient_dir(anchor, ambient_authority()) {
+        return Ok((dir, 0));
+    }
+    let mut prefix = anchor.to_path_buf();
+    for (index, name) in names.iter().enumerate() {
+        if index + 1 == names.len() { break }
+        prefix.push(name);
+        if std::fs::symlink_metadata(&prefix).is_ok_and(|metadata| metadata.file_type().is_symlink()) {
+            return Err(Failure::new("POLICY_DENIED", "Links, reparse points and special objects are not traversed; inspect the target path for the offending entry"));
+        }
+        if let Ok(dir) = Dir::open_ambient_dir(&prefix, ambient_authority()) {
+            return Ok((dir, index + 1));
+        }
+    }
+    Err(Failure::new("ACCESS_DENIED", "No ancestor directory of the requested path is openable by this process"))
+}
+
 pub fn checked(raw: &str) -> Result<Target> {
     let path = Path::new(raw);
     if !path.is_absolute() || raw.len() > 4096 || raw.contains('\0') {
@@ -30,7 +62,8 @@ pub fn checked(raw: &str) -> Result<Target> {
             _ => return Err(Failure::new("INVALID_ARGUMENT", "Worker paths must be lexically normalized")),
         }
     }
-    let mut parent = Dir::open_ambient_dir(&anchor, ambient_authority())?;
+    let (mut parent, anchored) = open_anchor(&anchor, &names)?;
+    let mut names = names.split_off(anchored);
     let name = names.pop().unwrap_or_else(|| ".".into());
     for component in names {
         regular(&parent.symlink_metadata(&component)?, true)?;
