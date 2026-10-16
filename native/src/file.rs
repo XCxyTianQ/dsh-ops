@@ -535,11 +535,22 @@ impl PreservedMetadata {
             None => {
                 // A new inode can inherit a parent's default ACL even when the old
                 // inode had no access ACL. Do not publish those inherited grants.
-                #[cfg(target_os = "linux")]
+                #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
                 match rustix::fs::fremovexattr(file, ACL_XATTR) {
                     Ok(()) => (),
                     Err(error) if matches!(error, rustix::io::Errno::NODATA | rustix::io::Errno::NOTSUP) => (),
                     Err(error) => return Err(Failure::new("ACCESS_DENIED", format!("Inherited POSIX ACL could not be cleared ({error}); nothing was published"))),
+                }
+                // OHOS (HarmonyOS / hmdfs) rejects the ACL xattr outright (EPERM), and
+                // this arm runs only when the original inode carried no access ACL, so
+                // there is nothing to preserve. Refusing every replacement there would
+                // make the file tools unusable; attempt it best-effort and report the
+                // outcome as a warning instead of a failed publish.
+                #[cfg(all(target_os = "linux", target_env = "ohos"))]
+                if let Err(error) = rustix::fs::fremovexattr(file, ACL_XATTR) {
+                    if !matches!(error, rustix::io::Errno::NODATA | rustix::io::Errno::NOTSUP) {
+                        warnings.push(format!("Inherited POSIX ACL could not be cleared ({error}); the replacement keeps whatever the parent grants"));
+                    }
                 }
                 false
             },

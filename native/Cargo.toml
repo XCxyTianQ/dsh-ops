@@ -25,3 +25,10 @@ uuid = { version = "1.26", features = ["v4"] }
 
 [lints.rust]
 unsafe_code = "forbid"
+
+# OHOS: openat2 is killed by SIGSYS on HarmonyOS (no userspace fallback can
+# observe it), so this ships cap-primitives 3.4.6 with an ENOSYS guard that
+# routes every caller through the library's own `manually::open` fallback.
+# Same crate version as upstream's lockfile; see vendor/cap-primitives.
+[patch.crates-io]
+cap-primitives = { path = "../vendor/cap-primitives" }
