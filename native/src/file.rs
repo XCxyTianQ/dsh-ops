@@ -31,7 +31,12 @@ const ENVELOPE_OVERHEAD: usize = 512;
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 struct InspectArgs {
-    path: String,
+    #[serde(default)]
+    path: Option<String>,
+    /// Aggregate form: one call inspects up to 32 files. The per-file rules are
+    /// unchanged, and each item reports its own failure instead of failing the call.
+    #[serde(default)]
+    paths: Option<Vec<String>>,
     #[serde(default = "one")]
     offset: usize,
     #[serde(default = "two_hundred")]
@@ -301,7 +306,9 @@ fn result(items: Vec<Value>, total: usize, offset: usize, next_base: usize, matc
 fn inspect(request: &Request) -> Result<Value> {
     let args: InspectArgs = serde_json::from_value(request.args.clone())?;
     if args.limit == 0 || args.limit > 10_000 || !args.encoding.eq_ignore_ascii_case("utf-8") { return Err(Failure::new("INVALID_ARGUMENT", "inspect supports UTF-8 and a bounded limit")); }
-    let path = target(&args.path, false)?;
+    if let Some(paths) = args.paths.as_ref() { return inspect_many(request, &args, paths); }
+    let raw = args.path.as_ref().ok_or_else(|| Failure::new("INVALID_ARGUMENT", "inspect requires path or paths"))?;
+    let path = target(raw, false)?;
     if !path.is_file() { return Err(Failure::new("INVALID_ARGUMENT", "path is a directory; use ops_glob or ops_grep")); }
     let bytes = read_bytes(&path)?;
     if bytes.len() as u64 > MAX_FILE_BYTES { return Err(Failure::new("OUTPUT_LIMIT", "file exceeds the inspect size budget")); }
@@ -321,6 +328,75 @@ fn inspect(request: &Request) -> Result<Value> {
     let text = String::from_utf8(bytes).map_err(|_| Failure::new("INVALID_ARGUMENT", "file is not valid UTF-8"))?;
     let lines: Vec<_> = text.lines().enumerate().skip(args.offset.saturating_sub(1)).take(args.limit).map(|(i, line)| json!({"path":path,"line":i+1,"text":line})).collect();
     Ok(result(lines, text.lines().count(), args.offset.saturating_sub(1), args.offset, text.lines().count(), false))
+}
+
+/// One call, many files. Each path goes through the same authorization and bounds
+/// as the single form (no shortcut, no relaxed traversal rule); the point is that
+/// a caller who needs N files pays one process round trip instead of N. A bad path
+/// is reported as that item's error, so one refusal cannot hide the other results.
+fn inspect_many(request: &Request, args: &InspectArgs, paths: &[String]) -> Result<Value> {
+    const MAX_PATHS: usize = 32;
+    const TOTAL_TEXT_BUDGET: usize = 96 * 1024;
+    if paths.is_empty() || paths.len() > MAX_PATHS {
+        return Err(Failure::new("INVALID_ARGUMENT", format!("paths must hold 1 to {MAX_PATHS} entries")));
+    }
+    // Reading many files in one call keeps each answer small: the declared default
+    // limit is for a single file.
+    let per_file_limit = if args.limit == 200 { 20 } else { args.limit };
+    let mut items: Vec<Value> = Vec::new();
+    let mut failed = 0usize;
+    let mut used = 0usize;
+    let mut truncated = false;
+    for raw in paths {
+        if used >= TOTAL_TEXT_BUDGET {
+            truncated = true;
+            break;
+        }
+        if let Err(error) = request.authorize_path(Path::new(raw)) {
+            failed += 1;
+            items.push(json!({"path": raw, "error": {"code": error.code, "message": error.message}}));
+            continue;
+        }
+        let sub = Request {
+            tool: "inspect_local_file".into(),
+            args: json!({
+                "path": raw,
+                "offset": args.offset,
+                "limit": per_file_limit,
+                "encoding": args.encoding,
+                "view": args.view,
+            }),
+            ..request.clone()
+        };
+        match inspect(&sub) {
+            Ok(value) => {
+                let lines: Vec<&str> = value
+                    .get("items")
+                    .and_then(Value::as_array)
+                    .map(|all| all.iter().filter_map(|item| item.get("text").and_then(Value::as_str)).collect())
+                    .unwrap_or_default();
+                let text = lines.join("\n");
+                used += text.len();
+                items.push(json!({"path": raw, "lines": lines.len(), "text": text}));
+            }
+            Err(error) => {
+                failed += 1;
+                items.push(json!({"path": raw, "error": {"code": error.code, "message": error.message}}));
+            }
+        }
+    }
+    let complete = items.len() == paths.len() && !truncated;
+    Ok(json!({
+        "status": "completed",
+        "phase": "verify",
+        "changed": 0,
+        "matched": items.len() - failed,
+        "failed": failed,
+        "complete": complete,
+        "omitted": paths.len() - items.len(),
+        "truncated": truncated,
+        "items": items,
+    }))
 }
 fn glob(request: &Request) -> Result<Value> {
     let args: GlobArgs = serde_json::from_value(request.args.clone())?;
@@ -535,11 +611,22 @@ impl PreservedMetadata {
             None => {
                 // A new inode can inherit a parent's default ACL even when the old
                 // inode had no access ACL. Do not publish those inherited grants.
-                #[cfg(target_os = "linux")]
+                #[cfg(all(target_os = "linux", not(target_env = "ohos")))]
                 match rustix::fs::fremovexattr(file, ACL_XATTR) {
                     Ok(()) => (),
                     Err(error) if matches!(error, rustix::io::Errno::NODATA | rustix::io::Errno::NOTSUP) => (),
                     Err(error) => return Err(Failure::new("ACCESS_DENIED", format!("Inherited POSIX ACL could not be cleared ({error}); nothing was published"))),
+                }
+                // OHOS (HarmonyOS / hmdfs) rejects the ACL xattr outright (EPERM), and
+                // this arm runs only when the original inode carried no access ACL, so
+                // there is nothing to preserve. Refusing every replacement there would
+                // make the file tools unusable; attempt it best-effort and report the
+                // outcome as a warning instead of a failed publish.
+                #[cfg(all(target_os = "linux", target_env = "ohos"))]
+                if let Err(error) = rustix::fs::fremovexattr(file, ACL_XATTR) {
+                    if !matches!(error, rustix::io::Errno::NODATA | rustix::io::Errno::NOTSUP) {
+                        warnings.push(format!("Inherited POSIX ACL could not be cleared ({error}); the replacement keeps whatever the parent grants"));
+                    }
                 }
                 false
             },

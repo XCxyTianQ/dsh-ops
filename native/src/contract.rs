@@ -129,7 +129,7 @@ impl Request {
 }
 pub type Result<T> = std::result::Result<T, Failure>;
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Clone)]
 #[serde(deny_unknown_fields)]
 pub struct Request {
     pub root: String,
@@ -162,6 +162,10 @@ pub struct BatchArgs {
     #[serde(default)]
     pub protect: Vec<String>,
     pub id: Option<String>,
+    /// Portable handoff: the manifest is also written to this workspace-relative
+    /// path, so a later process can be handed the file instead of the store entry.
+    #[serde(default)]
+    pub plan_path: Option<String>,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]

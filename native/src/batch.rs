@@ -128,6 +128,12 @@ pub fn run(root: &Dir, store: &Store, request: &Request) -> Result<Value> {
                 items,
             };
             store.save(&job.id, &job)?;
+            // The store copy stays authoritative for this session; the file is a handoff
+            // that survives the session, which is the only way a review-then-apply flow
+            // can work across processes.
+            if let Some(raw) = args.plan_path.as_deref() {
+                write_portable(root, raw, &job)?;
+            }
             if args.action == "run" {
                 execute(root, store, &mut job, request)?;
             }
@@ -140,19 +146,49 @@ pub fn run(root: &Dir, store: &Store, request: &Request) -> Result<Value> {
                     "Resume cannot change targets or protections",
                 ));
             }
-            let id = args
-                .id
-                .ok_or_else(|| Failure::new("INVALID_ARGUMENT", "Resume requires id"))?;
-            let mut job: Job = store.read(&id)?;
-            authorize(&job, request)?;
-            if job.id != id {
-                return Err(Failure::new("POLICY_DENIED", "Manifest identity mismatch"));
-            }
+            let portable = args.id.is_none();
+            let mut job: Job = match (args.id.as_deref(), args.plan_path.as_deref()) {
+                (Some(id), _) => {
+                    let job: Job = store.read(id)?;
+                    if job.id != id {
+                        return Err(Failure::new("POLICY_DENIED", "Manifest identity mismatch"));
+                    }
+                    // A store entry belongs to the session that created it.
+                    authorize(&job, request)?;
+                    job
+                }
+                (None, Some(raw)) => {
+                    // An explicitly presented plan file is the handoff. The root identity
+                    // must still match, and every revision check below still runs against
+                    // the live tree, so a stale plan is refused rather than applied.
+                    let job = read_portable(root, raw)?;
+                    if job.root != request.root || job.root_identity != request.root_identity {
+                        return Err(Failure::new(
+                            "POLICY_DENIED",
+                            "Plan was written for a different root",
+                        ));
+                    }
+                    job
+                }
+                (None, None) => {
+                    return Err(Failure::new(
+                        "INVALID_ARGUMENT",
+                        "Resume requires id or planPath",
+                    ))
+                }
+            };
             validate_saved(&job)?;
             for item in &job.items {
                 if item.state == State::Pending { paths::authorize_tree(root, &item.operation.path, request)?; }
             }
             execute(root, store, &mut job, request)?;
+            if portable {
+                if let Some(raw) = args.plan_path.as_deref() {
+                    // Record progress in the handoff file too; a failed rewrite must not
+                    // turn an applied plan into a reported non-effect.
+                    let _ = write_portable(root, raw, &job);
+                }
+            }
             Ok(summary(&job))
         }
         _ => Err(Failure::new(
@@ -161,6 +197,31 @@ pub fn run(root: &Dir, store: &Store, request: &Request) -> Result<Value> {
         )),
     }
 }
+/// Plan files live inside the root and carry the same manifest the store holds.
+fn portable_relative(raw: &str) -> Result<String> {
+    let relative = paths::relative(raw)?;
+    if relative.is_empty() || relative.starts_with("..") {
+        return Err(Failure::new(
+            "INVALID_ARGUMENT",
+            "planPath must stay inside the root",
+        ));
+    }
+    Ok(relative)
+}
+fn write_portable(root: &Dir, raw: &str, job: &Job) -> Result<()> {
+    let relative = portable_relative(raw)?;
+    let bytes = serde_json::to_vec_pretty(job)
+        .map_err(|error| Failure::new("INVALID_ARGUMENT", format!("plan serialization failed: {error}")))?;
+    root.write(&relative, &bytes)?;
+    Ok(())
+}
+fn read_portable(root: &Dir, raw: &str) -> Result<Job> {
+    let relative = portable_relative(raw)?;
+    let bytes = root.read(&relative)?;
+    serde_json::from_slice(&bytes)
+        .map_err(|error| Failure::new("INVALID_ARGUMENT", format!("plan file is not a manifest: {error}")))
+}
+
 pub fn authorize(job: &Job, request: &Request) -> Result<()> {
     if job.version != 1
         || job.scope != request.scope
@@ -349,9 +410,30 @@ pub fn summary(job: &Job) -> Value {
     let completed = count(State::Completed);
     let failed = count(State::Failed);
     let unknown = count(State::Unknown);
+    // Name the refused items inline. The per-item detail lives behind `detailsRef`, and a
+    // caller that never pages it cannot tell "this was refused for a reason" from "this
+    // failed for an unknown one" - which is the one distinction an audited apply exists to
+    // provide. Bounded so a large plan cannot inflate the answer.
+    let refusals: Vec<Value> = job
+        .items
+        .iter()
+        .filter(|item| item.state == State::Failed || item.state == State::Unknown)
+        .take(8)
+        .map(|item| {
+            json!({
+                "path": item.operation.path,
+                "to": item.operation.to,
+                "state": if item.state == State::Failed { "failed" } else { "unknown" },
+                "code": item.error.as_ref().map(|error| error.code.clone()),
+                "message": item.error.as_ref().map(|error| error.message.clone()),
+            })
+        })
+        .collect();
+    let refused_total = failed + unknown;
     json!({ "id": job.id, "status": if completed == job.items.len() { "completed" } else if unknown > 0 { "unknown" } else if failed > 0 { "partial_completion" } else { "planned" },
+        "refusals": refusals, "refusalsOmitted": refused_total.saturating_sub(8),
         "phase": if completed+failed+unknown == 0 { "preflight" } else { "settled" }, "done": completed, "total": job.items.len(), "failed": failed, "unknown": unknown,
         "logicalBytes": job.items.iter().map(|i| i.logical_bytes).sum::<u64>(), "byteSemantics": "logical_path_bytes_not_physical_reclaimed_space",
         "detailsRef": job.id, "complete": false, "omitted": job.items.len(),
-        "nextAction": if unknown > 0 { "Resume verifies unknown items only; inspect unresolved manifest entries before manual repair." } else { "Use ops_result page with detailsRef for complete per-item data." } })
+        "nextAction": if unknown > 0 { "Resume verifies unknown items only; inspect unresolved manifest entries before manual repair." } else if failed > 0 { "Refused items are listed in refusals; ops_result page with detailsRef has the complete per-item data." } else { "Use ops_result page with detailsRef for complete per-item data." } })
 }
